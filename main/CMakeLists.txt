@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "ethernet_example_main.c"
+        "mqtt.c"
+    INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        esp_event
+        esp_netif
+        esp_eth
+        ethernet_init
+        mqtt
+        nvs_flash
+        esp_timer
+)
