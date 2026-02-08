@@ -43,20 +43,35 @@ static const char *TAG = "apollo_p4";
 #define IP_STATE_TOPIC      BASE_TOPIC "/ip"
 #define UPTIME_STATE_TOPIC  BASE_TOPIC "/uptime"
 
+// RF (stub) topics
+#define RF_LAST_STATE_TOPIC  BASE_TOPIC "/rf_last"
+#define RF_RAW_TOPIC         BASE_TOPIC "/rf/raw"
+
 // Discovery topics
-#define IP_DISC_TOPIC       HA_DISCOVERY_PREFIX "/sensor/" DEVICE_ID "/ip/config"
-#define UPTIME_DISC_TOPIC   HA_DISCOVERY_PREFIX "/sensor/" DEVICE_ID "/uptime/config"
+#define IP_DISC_TOPIC        HA_DISCOVERY_PREFIX "/sensor/" DEVICE_ID "/ip/config"
+#define UPTIME_DISC_TOPIC    HA_DISCOVERY_PREFIX "/sensor/" DEVICE_ID "/uptime/config"
+#define RF_LAST_DISC_TOPIC   HA_DISCOVERY_PREFIX "/sensor/" DEVICE_ID "/rf_last/config"
 
 // Publish uptime every N seconds
 #define UPTIME_PUBLISH_PERIOD_SEC  10
 
-static esp_netif_t *s_eth_netif = NULL;
+// Publish a dummy RF event every N seconds (until RX is implemented)
+#define RF_STUB_PUBLISH_PERIOD_SEC  15
 
+static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t *s_eth_handles = NULL;
 static uint8_t s_eth_count = 0;
 
 static char s_ip_str[32] = "0.0.0.0";
 static TimerHandle_t s_uptime_timer = NULL;
+static TimerHandle_t s_rf_stub_timer = NULL;
+
+static uint32_t s_rf_stub_counter = 0;
+
+// Cached CC1101 ID (for logging / dummy payload)
+static bool s_cc1101_ok = false;
+static uint8_t s_cc_partnum = 0;
+static uint8_t s_cc_version = 0;
 
 static void publish_availability(bool online)
 {
@@ -80,6 +95,18 @@ static void publish_uptime_state(void)
     snprintf(buf, sizeof(buf), "%" PRId64, sec);
 
     mqtt_publish(UPTIME_STATE_TOPIC, buf, 0, false);
+}
+
+static void publish_rf_last_state(const char *payload)
+{
+    if (!mqtt_is_connected()) return;
+    mqtt_publish(RF_LAST_STATE_TOPIC, payload, 0, false);
+}
+
+static void publish_rf_raw(const char *payload)
+{
+    if (!mqtt_is_connected()) return;
+    mqtt_publish(RF_RAW_TOPIC, payload, 0, false);
 }
 
 static void publish_discovery(void)
@@ -130,10 +157,34 @@ static void publish_discovery(void)
         DEVICE_ID, DEVICE_NAME
     );
 
+    // RF last-event sensor (shows last RF message string)
+    char rf_cfg[700];
+    snprintf(rf_cfg, sizeof(rf_cfg),
+        "{"
+          "\"name\":\"%s RF Last\","
+          "\"unique_id\":\"%s_rf_last\","
+          "\"state_topic\":\"%s\","
+          "\"icon\":\"mdi:radio\","
+          "\"availability_topic\":\"%s\","
+          "\"payload_available\":\"online\","
+          "\"payload_not_available\":\"offline\","
+          "\"device\":{"
+            "\"identifiers\":[\"%s\"],"
+            "\"name\":\"%s\","
+            "\"manufacturer\":\"DIY\","
+            "\"model\":\"ESP32-P4 Ethernet + CC1101\","
+            "\"sw_version\":\"esp-idf\""
+          "}"
+        "}",
+        DEVICE_NAME, DEVICE_ID, RF_LAST_STATE_TOPIC, AVAIL_TOPIC,
+        DEVICE_ID, DEVICE_NAME
+    );
+
     mqtt_publish(IP_DISC_TOPIC, ip_cfg, 1, true);
     mqtt_publish(UPTIME_DISC_TOPIC, up_cfg, 1, true);
+    mqtt_publish(RF_LAST_DISC_TOPIC, rf_cfg, 1, true);
 
-    ESP_LOGI(TAG, "HA discovery published");
+    ESP_LOGI(TAG, "HA discovery published (IP + uptime + RF last)");
 }
 
 static void on_mqtt_connected(void)
@@ -143,7 +194,20 @@ static void on_mqtt_connected(void)
     publish_ip_state();
     publish_uptime_state();
 
-    // Optional test message (you can remove)
+    // Publish a boot RF status message so HA gets an initial value
+    {
+        char boot_msg[128];
+        if (s_cc1101_ok) {
+            snprintf(boot_msg, sizeof(boot_msg),
+                     "boot: cc1101 ok (PARTNUM=0x%02X VERSION=0x%02X)",
+                     s_cc_partnum, s_cc_version);
+        } else {
+            snprintf(boot_msg, sizeof(boot_msg), "boot: cc1101 not ready");
+        }
+        publish_rf_last_state(boot_msg);
+    }
+
+    // Optional test message
     mqtt_publish("apollo/test", "hello from ESP32-P4 (ethernet)", 0, false);
 }
 
@@ -151,6 +215,33 @@ static void uptime_timer_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
     publish_uptime_state();
+}
+
+// Dummy RF event publisher (stub for now)
+static void rf_stub_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+
+    if (!mqtt_is_connected()) return;
+
+    s_rf_stub_counter++;
+
+    int64_t ms = esp_timer_get_time() / 1000LL;
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "stub rf event #%u @%lldms cc1101:%s pn=0x%02X v=0x%02X",
+             (unsigned)s_rf_stub_counter,
+             (long long)ms,
+             s_cc1101_ok ? "ok" : "no",
+             s_cc_partnum,
+             s_cc_version);
+
+    // 1) Human-readable last-event sensor
+    publish_rf_last_state(msg);
+
+    // 2) Raw topic (in future this becomes JSON + real RF frames)
+    publish_rf_raw(msg);
 }
 
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
@@ -211,7 +302,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "*** Booting Apollo P4 (Ethernet + MQTT + HA) ***");
 
-    // ---- CC1101 presence check (safe: logs errors but does NOT stop boot) ----
+    // ---- CC1101 presence check (safe: does NOT stop boot) ----
     {
         cc1101_pins_t cc = {
             .pin_cs   = 5,   // CSN
@@ -225,17 +316,22 @@ void app_main(void)
         esp_err_t err = cc1101_init(&cc);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "CC1101 init failed: %s", esp_err_to_name(err));
+            s_cc1101_ok = false;
         } else {
             cc1101_id_t id = {0};
             err = cc1101_read_id(&id);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "CC1101 read_id failed: %s", esp_err_to_name(err));
+                s_cc1101_ok = false;
             } else {
+                s_cc1101_ok = true;
+                s_cc_partnum = id.partnum;
+                s_cc_version = id.version;
                 ESP_LOGI(TAG, "CC1101 ID: PARTNUM=0x%02X VERSION=0x%02X", id.partnum, id.version);
             }
         }
     }
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -273,6 +369,15 @@ void app_main(void)
                                   uptime_timer_cb);
     if (s_uptime_timer) {
         xTimerStart(s_uptime_timer, 0);
+    }
+
+    s_rf_stub_timer = xTimerCreate("rf_stub_pub",
+                                   pdMS_TO_TICKS(RF_STUB_PUBLISH_PERIOD_SEC * 1000),
+                                   pdTRUE,
+                                   NULL,
+                                   rf_stub_timer_cb);
+    if (s_rf_stub_timer) {
+        xTimerStart(s_rf_stub_timer, 0);
     }
 
     ESP_LOGI(TAG, "Starting Ethernet driver...");
