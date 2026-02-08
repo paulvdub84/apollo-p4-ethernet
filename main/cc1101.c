@@ -1,356 +1,454 @@
 #include "cc1101.h"
 
 #include <string.h>
+#include <inttypes.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_timer.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 
-/* CC1101 strobes */
-#define CC1101_SRES   0x30
-#define CC1101_SIDLE  0x36
-#define CC1101_SRX    0x34
-#define CC1101_SFRX   0x3A
-#define CC1101_SCAL   0x33
-
-/* Burst/single read/write */
-#define CC1101_READ_SINGLE   0x80
-#define CC1101_READ_BURST    0xC0
-#define CC1101_WRITE_BURST   0x40
-
-/* Registers (addresses) */
-#define REG_IOCFG2     0x00
-#define REG_IOCFG0     0x02
-#define REG_FIFOTHR    0x03
-#define REG_PKTCTRL1   0x04
-#define REG_PKTCTRL0   0x05
-#define REG_PKTLEN     0x06
-#define REG_FSCTRL1    0x0B
-#define REG_FREQ2      0x0D
-#define REG_FREQ1      0x0E
-#define REG_FREQ0      0x0F
-#define REG_MDMCFG4    0x10
-#define REG_MDMCFG3    0x11
-#define REG_MDMCFG2    0x12
-#define REG_MDMCFG1    0x13
-#define REG_MDMCFG0    0x14
-#define REG_DEVIATN    0x15
-#define REG_MCSM1      0x17
-#define REG_MCSM0      0x18
-#define REG_FOCCFG     0x19
-#define REG_BSCFG      0x1A
-#define REG_AGCCTRL2   0x1B
-#define REG_AGCCTRL1   0x1C
-#define REG_AGCCTRL0   0x1D
-#define REG_FREND1     0x21
-#define REG_FREND0     0x22
-#define REG_FSCAL3     0x23
-#define REG_FSCAL2     0x24
-#define REG_FSCAL1     0x25
-#define REG_FSCAL0     0x26
-#define REG_TEST2      0x2C
-#define REG_TEST1      0x2D
-#define REG_TEST0      0x2E
-#define REG_PARTNUM    0x30
-#define REG_VERSION    0x31
-#define REG_LQI        0x33
-#define REG_RSSI       0x34
-#define REG_PKTSTATUS  0x38
-#define REG_RXBYTES    0x3B
-#define REG_FIFO       0x3F
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_check.h"
+#include "esp_timer.h"
 
 static const char *TAG = "cc1101";
 
-static spi_device_handle_t s_spi;
-static cc1101_rx_cb_t s_cb = NULL;
-static void *s_ctx = NULL;
-static TaskHandle_t s_rx_task = NULL;
+/* ======================= CC1101 SPI / Registers ======================= */
 
-/* Reliability tuning */
-#define POLL_MS                   15
-#define RSSI_STRONG_DBM           (-90)  // gate threshold (looser; we filter later)
-#define MAX_CAPTURE_BYTES         64     // capture window for CRC scanning
-#define CAPTURE_WAIT_MS           90     // wait after detect to grab most of burst
-#define QUIET_AFTER_CAPTURE_MS    1200   // avoid repeated triggers
+#define CC1101_WRITE_BURST   0x40
+#define CC1101_READ_SINGLE   0x80
+#define CC1101_READ_BURST    0xC0
+
+/* Command strobes */
+#define CC1101_SRES   0x30
+#define CC1101_SFSTXON 0x31
+#define CC1101_SXOFF  0x32
+#define CC1101_SCAL   0x33
+#define CC1101_SRX    0x34
+#define CC1101_STX    0x35
+#define CC1101_SIDLE  0x36
+#define CC1101_SWOR   0x38
+#define CC1101_SPWD   0x39
+#define CC1101_SFRX   0x3A
+#define CC1101_SFTX   0x3B
+#define CC1101_SWORRST 0x3C
+#define CC1101_SNOP   0x3D
+
+/* Config registers */
+#define CC1101_IOCFG2     0x00
+#define CC1101_IOCFG1     0x01
+#define CC1101_IOCFG0     0x02
+#define CC1101_FIFOTHR    0x03
+#define CC1101_SYNC1      0x04
+#define CC1101_SYNC0      0x05
+#define CC1101_PKTLEN     0x06
+#define CC1101_PKTCTRL1   0x07
+#define CC1101_PKTCTRL0   0x08
+#define CC1101_ADDR       0x09
+#define CC1101_CHANNR     0x0A
+#define CC1101_FSCTRL1    0x0B
+#define CC1101_FSCTRL0    0x0C
+#define CC1101_FREQ2      0x0D
+#define CC1101_FREQ1      0x0E
+#define CC1101_FREQ0      0x0F
+#define CC1101_MDMCFG4    0x10
+#define CC1101_MDMCFG3    0x11
+#define CC1101_MDMCFG2    0x12
+#define CC1101_MDMCFG1    0x13
+#define CC1101_MDMCFG0    0x14
+#define CC1101_DEVIATN    0x15
+#define CC1101_MCSM2      0x16
+#define CC1101_MCSM1      0x17
+#define CC1101_MCSM0      0x18
+#define CC1101_FOCCFG     0x19
+#define CC1101_BSCFG      0x1A
+#define CC1101_AGCCTRL2   0x1B
+#define CC1101_AGCCTRL1   0x1C
+#define CC1101_AGCCTRL0   0x1D
+#define CC1101_WOREVT1    0x1E
+#define CC1101_WOREVT0    0x1F
+#define CC1101_WORCTRL    0x20
+#define CC1101_FREND1     0x21
+#define CC1101_FREND0     0x22
+#define CC1101_FSCAL3     0x23
+#define CC1101_FSCAL2     0x24
+#define CC1101_FSCAL1     0x25
+#define CC1101_FSCAL0     0x26
+#define CC1101_RCCTRL1    0x27
+#define CC1101_RCCTRL0    0x28
+#define CC1101_FSTEST     0x29
+#define CC1101_PTEST      0x2A
+#define CC1101_AGCTEST    0x2B
+#define CC1101_TEST2      0x2C
+#define CC1101_TEST1      0x2D
+#define CC1101_TEST0      0x2E
+
+/* Status registers */
+#define CC1101_PARTNUM    0x30
+#define CC1101_VERSION    0x31
+#define CC1101_RXBYTES    0x3B
+
+/* FIFO */
+#define CC1101_FIFO       0x3F
+
+/* ======================= Driver state ======================= */
+
+typedef struct {
+    bool inited;
+    cc1101_pins_t pins;
+    spi_device_handle_t spi;
+    SemaphoreHandle_t spi_lock;
+
+    TaskHandle_t rx_task;
+    cc1101_rx_cb_t cb;
+    void *cb_ctx;
+
+    volatile bool rx_running;
+} cc1101_ctx_t;
+
+static cc1101_ctx_t s;
+
+/* ======================= Low-level SPI helpers ======================= */
 
 static esp_err_t spi_txrx(const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    spi_transaction_t t = {
-        .length = len * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    return spi_device_transmit(s_spi, &t);
+    spi_transaction_t t = {0};
+    t.length = len * 8;
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
+
+    esp_err_t err;
+    xSemaphoreTake(s.spi_lock, portMAX_DELAY);
+    err = spi_device_transmit(s.spi, &t);
+    xSemaphoreGive(s.spi_lock);
+    return err;
 }
 
-static void strobe(uint8_t cmd)
+static esp_err_t cc1101_strobe(uint8_t cmd)
 {
-    uint8_t tx = cmd;
-    uint8_t rx = 0;
-    (void)spi_txrx(&tx, &rx, 1);
+    uint8_t tx[1] = { cmd };
+    uint8_t rx[1] = { 0 };
+    return spi_txrx(tx, rx, 1);
 }
 
-static uint8_t read_reg(uint8_t reg)
+static esp_err_t cc1101_write_reg(uint8_t addr, uint8_t val)
 {
-    uint8_t tx[2] = { (uint8_t)(reg | CC1101_READ_SINGLE), 0x00 };
-    uint8_t rx[2] = {0};
-    (void)spi_txrx(tx, rx, 2);
-    return rx[1];
+    uint8_t tx[2] = { addr, val };
+    uint8_t rx[2] = { 0 };
+    return spi_txrx(tx, rx, 2);
 }
 
-static void write_reg(uint8_t reg, uint8_t val)
+static esp_err_t cc1101_read_reg_status(uint8_t addr, uint8_t *out)
 {
-    uint8_t tx[2] = { reg, val };
-    uint8_t rx[2] = {0};
-    (void)spi_txrx(tx, rx, 2);
+    uint8_t tx[2] = { (uint8_t)(addr | CC1101_READ_SINGLE), 0x00 };
+    uint8_t rx[2] = { 0 };
+    esp_err_t err = spi_txrx(tx, rx, 2);
+    if (err == ESP_OK) *out = rx[1];
+    return err;
 }
 
-static void read_burst(uint8_t reg, uint8_t *buf, size_t len)
+static esp_err_t cc1101_read_burst(uint8_t addr, uint8_t *out, size_t len)
 {
-    uint8_t tx[len + 1];
-    uint8_t rx[len + 1];
-    memset(tx, 0, sizeof(tx));
-    tx[0] = (uint8_t)(reg | CC1101_READ_BURST);
-    (void)spi_txrx(tx, rx, len + 1);
-    memcpy(buf, &rx[1], len);
-}
+    if (len == 0) return ESP_OK;
 
-static int8_t rssi_raw_to_dbm(uint8_t rssi_raw)
-{
-    // good enough for gating / relative values
-    return (int8_t)((int)rssi_raw / 2 - 74);
-}
+    uint8_t hdr = addr | CC1101_READ_BURST;
 
-static bool looks_like_repeating_byte(const uint8_t *d, uint8_t len)
-{
-    if (len < 8) return false;
-    uint8_t b = d[0];
-    for (uint8_t i = 1; i < len; i++) {
-        if (d[i] != b) return false;
+    spi_transaction_t t = {0};
+    t.length = (1 + len) * 8;
+
+    uint8_t *tx = heap_caps_malloc(1 + len, MALLOC_CAP_DEFAULT);
+    uint8_t *rx = heap_caps_malloc(1 + len, MALLOC_CAP_DEFAULT);
+    if (!tx || !rx) {
+        if (tx) heap_caps_free(tx);
+        if (rx) heap_caps_free(rx);
+        return ESP_ERR_NO_MEM;
     }
-    return true;
+
+    tx[0] = hdr;
+    memset(&tx[1], 0, len);
+    memset(rx, 0, 1 + len);
+
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
+
+    esp_err_t err;
+    xSemaphoreTake(s.spi_lock, portMAX_DELAY);
+    err = spi_device_transmit(s.spi, &t);
+    xSemaphoreGive(s.spi_lock);
+
+    if (err == ESP_OK) memcpy(out, &rx[1], len);
+
+    heap_caps_free(tx);
+    heap_caps_free(rx);
+    return err;
 }
 
-/*
- Apollo profile config:
-  - 433.92MHz (assumes 26MHz XTAL on CC1101 module)
-  - 2-FSK
-  - Manchester decoding enabled
-  - ~1.0kbps
-  - RX BW ~58kHz
-  - deviation ~5.2kHz
-  - infinite packet length (we do framing ourselves)
-  - no sync requirement (we gate by carrier/RSSI)
-*/
-static void cc1101_config_apollo(void)
+/* ======================= RSSI helper ======================= */
+
+static int8_t cc1101_rssi_to_dbm(uint8_t rssi_raw)
 {
-    strobe(CC1101_SIDLE);
-    strobe(CC1101_SFRX);
+    int16_t rssi_dec = (rssi_raw >= 128) ? ((int16_t)rssi_raw - 256) : rssi_raw;
+    int16_t dbm = (rssi_dec / 2) - 74;
+    if (dbm < -128) dbm = -128;
+    if (dbm > 127) dbm = 127;
+    return (int8_t)dbm;
+}
 
-    // GDOs: safe defaults (not currently used)
-    write_reg(REG_IOCFG2, 0x29);
-    write_reg(REG_IOCFG0, 0x2E);
+/* ======================= IRQ + RX task ======================= */
 
-    // FIFO threshold (default-ish)
-    write_reg(REG_FIFOTHR, 0x07);
+static void IRAM_ATTR gdo0_isr(void *arg)
+{
+    (void)arg;
+    BaseType_t hp = pdFALSE;
+    if (s.rx_task) vTaskNotifyGiveFromISR(s.rx_task, &hp);
+    if (hp) portYIELD_FROM_ISR();
+}
 
-    // Packet handling: infinite length, no HW CRC
-    write_reg(REG_PKTCTRL1, 0x00);
-    write_reg(REG_PKTCTRL0, 0x02);  // LENGTH_CONFIG=2 (infinite), CRC off
-    write_reg(REG_PKTLEN, 0xFF);
-
-    // IF frequency
-    write_reg(REG_FSCTRL1, 0x06);
-
-    // 433.92 MHz -> FREQ = 0x10B071 (26MHz XTAL)
-    write_reg(REG_FREQ2, 0x10);
-    write_reg(REG_FREQ1, 0xB0);
-    write_reg(REG_FREQ0, 0x71);
-
-    // MDMCFG4/3:
-    //  - RX BW ~58kHz (CHANBW_E=3, CHANBW_M=3)
-    //  - Data rate ~1001 bps (DRATE_E=5, DRATE_M=0x43)
-    write_reg(REG_MDMCFG4, 0xF5);
-    write_reg(REG_MDMCFG3, 0x43);
-
-    // MDMCFG2:
-    //  - 2-FSK (MOD_FORMAT=0)
-    //  - Manchester enable
-    //  - SYNC_MODE=0 (no sync)
-    write_reg(REG_MDMCFG2, 0x08);
-
-    // spacing/others not critical in single-channel sniff mode
-    write_reg(REG_MDMCFG1, 0x22);
-    write_reg(REG_MDMCFG0, 0xF8);
-
-    // Deviation ~5.16kHz
-    write_reg(REG_DEVIATN, 0x15);
-
-    // Main state machine: stay in RX after RX, auto-cal
-    write_reg(REG_MCSM1, 0x3C);
-    write_reg(REG_MCSM0, 0x10); // FS_AUTOCAL=1
-
-    // Typical recommended baseband settings
-    write_reg(REG_FOCCFG,  0x16);
-    write_reg(REG_BSCFG,   0x6C);
-    write_reg(REG_AGCCTRL2,0x03);
-    write_reg(REG_AGCCTRL1,0x40);
-    write_reg(REG_AGCCTRL0,0x91);
-    write_reg(REG_FREND1,  0x56);
-    write_reg(REG_FREND0,  0x10);
-    write_reg(REG_FSCAL3,  0xE9);
-    write_reg(REG_FSCAL2,  0x2A);
-    write_reg(REG_FSCAL1,  0x00);
-    write_reg(REG_FSCAL0,  0x1F);
-    write_reg(REG_TEST2,   0x81);
-    write_reg(REG_TEST1,   0x35);
-    write_reg(REG_TEST0,   0x09);
-
-    // Calibrate then RX
-    strobe(CC1101_SCAL);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    strobe(CC1101_SRX);
+static esp_err_t cc1101_flush_rx(void)
+{
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SIDLE), TAG, "SIDLE");
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SFRX), TAG, "SFRX");
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SRX), TAG, "SRX");
+    return ESP_OK;
 }
 
 static void rx_task_fn(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "Apollo RX task running (FSK + Manchester, burst capture)");
 
-    uint32_t quiet_until_ms = 0;
+    while (s.rx_running) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!s.rx_running) break;
 
-    while (1) {
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-
-        if (quiet_until_ms && (int32_t)(now_ms - quiet_until_ms) < 0) {
-            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        // Read RXBYTES
+        uint8_t rxbytes = 0;
+        if (cc1101_read_reg_status(CC1101_RXBYTES, &rxbytes) != ESP_OK) {
             continue;
         }
+        rxbytes &= 0x7F;
+        if (rxbytes == 0) continue;
 
-        uint8_t pktstatus = read_reg(REG_PKTSTATUS);
-        bool carrier = (pktstatus & 0x40) != 0; // CS bit
-        int8_t rssi_dbm = rssi_raw_to_dbm(read_reg(REG_RSSI));
+        uint8_t buf[64 + 2] = {0};
+        size_t total = 0;
 
-        // gate: either carrier present OR strong-ish RSSI
-        if (!carrier && rssi_dbm < RSSI_STRONG_DBM) {
-            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
-            continue;
+        for (int loops = 0; loops < 8; loops++) {
+            if (cc1101_read_reg_status(CC1101_RXBYTES, &rxbytes) != ESP_OK) break;
+            rxbytes &= 0x7F;
+            if (rxbytes == 0) break;
+
+            size_t to_read = rxbytes;
+            if (to_read > sizeof(buf) - total) to_read = sizeof(buf) - total;
+            if (to_read == 0) break;
+
+            if (cc1101_read_burst(CC1101_FIFO, &buf[total], to_read) != ESP_OK) break;
+            total += to_read;
+
+            if (total >= sizeof(buf)) break;
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        // Wait long enough to capture most of the burst (~136ms total).
-        vTaskDelay(pdMS_TO_TICKS(CAPTURE_WAIT_MS));
+        if (total < 3) continue;
 
-        uint8_t rxbytes = read_reg(REG_RXBYTES) & 0x7F;
-        if (rxbytes == 0) {
-            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
-            continue;
+        uint8_t rssi_raw = buf[total - 2];
+        uint8_t lqi_crc  = buf[total - 1];
+
+        cc1101_rx_frame_t frame = {0};
+        frame.ts_ms = (uint32_t)esp_log_timestamp();
+        frame.rssi_dbm = cc1101_rssi_to_dbm(rssi_raw);
+        frame.lqi = (lqi_crc & 0x7F);
+        frame.crc_ok = (lqi_crc & 0x80) ? true : false;
+
+        size_t payload_len = total - 2;
+        if (payload_len > 64) payload_len = 64;
+        frame.len = (uint8_t)payload_len;
+        memcpy(frame.data, buf, payload_len);
+
+        if (s.cb) s.cb(&frame, s.cb_ctx);
+
+        if (rxbytes & 0x80) {
+            ESP_LOGW(TAG, "RX overflow, flushing");
+            cc1101_flush_rx();
         }
-
-        if (rxbytes > MAX_CAPTURE_BYTES) rxbytes = MAX_CAPTURE_BYTES;
-
-        cc1101_rx_frame_t f = {0};
-        f.ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        f.rssi_dbm = rssi_dbm;
-
-        uint8_t lqi = read_reg(REG_LQI);
-        f.lqi = lqi & 0x7F;
-        f.crc_ok = (lqi & 0x80) != 0; // CC1101 CRC flag (not the Apollo CRC8)
-
-        read_burst(REG_FIFO, f.data, rxbytes);
-        f.len = rxbytes;
-
-        // Flush FIFO & back to RX quickly
-        strobe(CC1101_SFRX);
-        strobe(CC1101_SRX);
-
-        // Drop obvious junk (all bytes equal)
-        if (looks_like_repeating_byte(f.data, f.len)) {
-            ESP_LOGD(TAG, "Dropped repeating-byte capture (len=%u rssi=%d)", f.len, (int)f.rssi_dbm);
-            quiet_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + QUIET_AFTER_CAPTURE_MS;
-            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
-            continue;
-        }
-
-        ESP_LOGI(TAG, "CAPTURE len=%u rssi=%d lqi=%u carrier=%d",
-                 f.len, (int)f.rssi_dbm, (unsigned)f.lqi, carrier ? 1 : 0);
-
-        if (s_cb) s_cb(&f, s_ctx);
-
-        // quiet period to avoid repeated triggers on same burst / local interference
-        quiet_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + QUIET_AFTER_CAPTURE_MS;
-
-        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
+
+    vTaskDelete(NULL);
 }
+
+/* ======================= Apollo profile config ======================= */
+
+static esp_err_t cc1101_config_apollo_profile(void)
+{
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SIDLE), TAG, "SIDLE");
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SFRX), TAG, "SFRX");
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SFTX), TAG, "SFTX");
+
+    // GDO0 = RX FIFO threshold
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_IOCFG0, 0x00), TAG, "IOCFG0");
+    // FIFO threshold ~16
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FIFOTHR, 0x03), TAG, "FIFOTHR");
+
+    // APPEND_STATUS=1
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_PKTCTRL1, 0x04), TAG, "PKTCTRL1");
+
+    // Infinite length
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_PKTCTRL0, 0x02), TAG, "PKTCTRL0");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_PKTLEN, 0xFF), TAG, "PKTLEN");
+
+    // 433.92 MHz (26 MHz crystal)
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FREQ2, 0x10), TAG, "FREQ2");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FREQ1, 0xB0), TAG, "FREQ1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FREQ0, 0x71), TAG, "FREQ0");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCTRL1, 0x06), TAG, "FSCTRL1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCTRL0, 0x00), TAG, "FSCTRL0");
+
+    // ~1 kbps, RXBW ~58 kHz
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MDMCFG4, 0xF5), TAG, "MDMCFG4");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MDMCFG3, 0x3E), TAG, "MDMCFG3");
+
+    // Manchester enabled, no sync
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MDMCFG2, 0x08), TAG, "MDMCFG2");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MDMCFG1, 0x22), TAG, "MDMCFG1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MDMCFG0, 0xF8), TAG, "MDMCFG0");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_DEVIATN, 0x15), TAG, "DEVIATN");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MCSM2, 0x07), TAG, "MCSM2");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MCSM1, 0x3C), TAG, "MCSM1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_MCSM0, 0x18), TAG, "MCSM0");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_AGCCTRL2, 0x43), TAG, "AGCCTRL2");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_AGCCTRL1, 0x40), TAG, "AGCCTRL1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_AGCCTRL0, 0x91), TAG, "AGCCTRL0");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCAL3, 0xE9), TAG, "FSCAL3");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCAL2, 0x2A), TAG, "FSCAL2");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCAL1, 0x00), TAG, "FSCAL1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_FSCAL0, 0x1F), TAG, "FSCAL0");
+
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_TEST2, 0x81), TAG, "TEST2");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_TEST1, 0x35), TAG, "TEST1");
+    ESP_RETURN_ON_ERROR(cc1101_write_reg(CC1101_TEST0, 0x09), TAG, "TEST0");
+
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SRX), TAG, "SRX");
+    return ESP_OK;
+}
+
+/* ======================= Public API ======================= */
 
 esp_err_t cc1101_init(const cc1101_pins_t *pins)
 {
-    if (!pins) return ESP_ERR_INVALID_ARG;
+    ESP_RETURN_ON_FALSE(pins != NULL, ESP_ERR_INVALID_ARG, TAG, "pins null");
+
+    memset(&s, 0, sizeof(s));
+    s.pins = *pins;
+    s.spi_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s.spi_lock != NULL, ESP_ERR_NO_MEM, TAG, "spi_lock");
 
     spi_bus_config_t buscfg = {
-        .mosi_io_num = pins->pin_mosi,
-        .miso_io_num = pins->pin_miso,
-        .sclk_io_num = pins->pin_sck,
+        .mosi_io_num = s.pins.pin_mosi,
+        .miso_io_num = s.pins.pin_miso,
+        .sclk_io_num = s.pins.pin_sck,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
+        .max_transfer_sz = 128,
     };
+
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO), TAG, "spi_bus_initialize");
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 2 * 1000 * 1000,
+        .clock_speed_hz = 8 * 1000 * 1000,
         .mode = 0,
-        .spics_io_num = pins->pin_cs,
+        .spics_io_num = s.pins.pin_cs,
         .queue_size = 1,
+        // IMPORTANT: do NOT set SPI_DEVICE_HALFDUPLEX (we need full-duplex for status reads)
+        .flags = 0,
     };
 
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi));
+    ESP_RETURN_ON_ERROR(spi_bus_add_device(SPI2_HOST, &devcfg, &s.spi), TAG, "spi_bus_add_device");
 
-    strobe(CC1101_SRES);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_config_t io = {0};
+    io.pin_bit_mask = (1ULL << s.pins.pin_gdo0);
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_POSEDGE;
+    ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "gpio_config gdo0");
 
+    ESP_RETURN_ON_ERROR(cc1101_strobe(CC1101_SRES), TAG, "SRES");
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    s.inited = true;
     ESP_LOGI(TAG, "CC1101 init OK");
     return ESP_OK;
 }
 
 esp_err_t cc1101_read_id(cc1101_id_t *out)
 {
-    if (!out) return ESP_ERR_INVALID_ARG;
-    out->partnum = read_reg(REG_PARTNUM);
-    out->version = read_reg(REG_VERSION);
+    ESP_RETURN_ON_FALSE(s.inited, ESP_ERR_INVALID_STATE, TAG, "not inited");
+    ESP_RETURN_ON_FALSE(out != NULL, ESP_ERR_INVALID_ARG, TAG, "out null");
+
+    uint8_t part = 0, ver = 0;
+    ESP_RETURN_ON_ERROR(cc1101_read_reg_status(CC1101_PARTNUM, &part), TAG, "read PARTNUM");
+    ESP_RETURN_ON_ERROR(cc1101_read_reg_status(CC1101_VERSION, &ver), TAG, "read VERSION");
+
+    out->partnum = part;
+    out->version = ver;
     return ESP_OK;
 }
 
 esp_err_t cc1101_start_rx_apollo(cc1101_rx_cb_t cb, void *user_ctx)
 {
-    s_cb = cb;
-    s_ctx = user_ctx;
+    ESP_RETURN_ON_FALSE(s.inited, ESP_ERR_INVALID_STATE, TAG, "not inited");
 
-    cc1101_config_apollo();
+    s.cb = cb;
+    s.cb_ctx = user_ctx;
 
-    if (!s_rx_task) {
-        BaseType_t ok = xTaskCreatePinnedToCore(
-            rx_task_fn,
-            "cc1101_rx",
-            4096,
-            NULL,
-            5,
-            &s_rx_task,
-            0
-        );
-        if (ok != pdPASS) return ESP_ERR_NO_MEM;
+    ESP_RETURN_ON_ERROR(cc1101_config_apollo_profile(), TAG, "config apollo");
+
+    if (!s.rx_task) {
+        s.rx_running = true;
+        BaseType_t ok = xTaskCreatePinnedToCore(rx_task_fn, "cc1101_rx", 4096, NULL, 10, &s.rx_task, 0);
+        ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "xTaskCreatePinnedToCore");
+    } else {
+        s.rx_running = true;
     }
 
-    ESP_LOGI(TAG, "RX started (Apollo profile: 433.92 FSK + Manchester)");
+    esp_err_t isr = gpio_install_isr_service(0);
+    if (isr != ESP_OK && isr != ESP_ERR_INVALID_STATE) {
+        return isr;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(s.pins.pin_gdo0, gdo0_isr, NULL), TAG, "gpio_isr_handler_add");
+
+    ESP_LOGI(TAG, "RX started (433.92MHz baseline)");
     return ESP_OK;
 }
 
 esp_err_t cc1101_stop_rx(void)
 {
-    if (s_rx_task) {
-        vTaskDelete(s_rx_task);
-        s_rx_task = NULL;
+    if (!s.inited) return ESP_OK;
+
+    s.rx_running = false;
+
+    if (s.pins.pin_gdo0 >= 0) {
+        gpio_isr_handler_remove(s.pins.pin_gdo0);
+        gpio_set_intr_type(s.pins.pin_gdo0, GPIO_INTR_DISABLE);
     }
-    strobe(CC1101_SIDLE);
+
+    if (s.rx_task) {
+        xTaskNotifyGive(s.rx_task);
+        s.rx_task = NULL;
+    }
+
+    cc1101_strobe(CC1101_SIDLE);
+    cc1101_strobe(CC1101_SFRX);
+
+    ESP_LOGI(TAG, "RX stopped");
     return ESP_OK;
 }
