@@ -1,14 +1,19 @@
-# ESP-IDF
+# Build output
 build/
-sdkconfig.old
 managed_components/
+
+# Generated files
+main/generated/
+build_number.txt
+
+# Binaries
+*.bin
+*.elf
+*.map
+
+# Archives
+*.zip
+
+# ESP-IDF leftovers
+sdkconfig.old
 dependencies.lock
-
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
-
-# Python
-__pycache__/
-*.pyc
